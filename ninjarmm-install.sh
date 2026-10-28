@@ -78,6 +78,9 @@ preflight() {
   [[ $EUID -eq 0 ]] || fail "Bitte als root ausführen (Proxmox-Shell oder sudo)."
   command -v dpkg >/dev/null || fail "dpkg nicht gefunden – das Skript ist nur für Debian-basierte Systeme (Proxmox VE)."
   command -v curl >/dev/null || fail "curl nicht gefunden (apt-get install curl)."
+  # Nicht auf einem bereits defekten Paketstand installieren, apt würde sonst mitreparieren
+  [[ -z "$(dpkg --audit 2>&1)" ]] \
+    || fail "Die Paketverwaltung meldet unvollständige Pakete (dpkg --audit). Zuerst beheben."
 
   if command -v pveversion >/dev/null; then
     msg_ok "Proxmox VE erkannt: $(pveversion | head -n1)"
@@ -110,37 +113,55 @@ install_agent() {
   # Leerzeichen/Zeilenumbrüche vom Einfügen entfernen
   AGENT_URL="${AGENT_URL//[[:space:]]/}"
   [[ -n "$AGENT_URL" ]] || fail "Kein Installationslink eingegeben. Installation abgebrochen."
-  [[ "$AGENT_URL" =~ ^https:// ]] || fail "Der Installationslink muss mit https:// beginnen."
+  [[ "$AGENT_URL" =~ ^https://[^\"\\]+$ ]] || fail "Der Installationslink muss mit https:// beginnen."
 
   local deb="$WORKDIR/ninjarmm-agent.deb"
+  local host="${AGENT_URL#https://}"
+  host="${host%%/*}"
 
-  msg_info "Lade NinjaOne-Agent herunter"
-  # -f: HTTP-Fehler (z. B. abgelaufener Link) als Fehler werten statt HTML zu speichern
-  curl -fsSL --retry 3 -o "$deb" "$AGENT_URL" >>"$LOG" 2>&1 \
+  msg_info "Lade NinjaOne-Agent herunter (${host})"
+  # -f: HTTP-Fehler (z. B. abgelaufener Link) als Fehler werten statt HTML zu speichern.
+  # URL über stdin (-K -), damit das Token nicht in der Prozessliste steht.
+  curl -fsSL --retry 3 -o "$deb" -K - <<<"url = \"${AGENT_URL}\"" >>"$LOG" 2>&1 \
     || fail "Download fehlgeschlagen. Ist der Link korrekt und noch gültig?"
-  dpkg-deb --info "$deb" >>"$LOG" 2>&1 \
+  local pkg version arch sysarch
+  pkg=$(dpkg-deb -f "$deb" Package 2>>"$LOG") \
     || fail "Die heruntergeladene Datei ist kein gültiges .deb-Paket (Linux-Installer für Debian/Ubuntu gewählt?)."
-  msg_ok "Download abgeschlossen"
+  version=$(dpkg-deb -f "$deb" Version)
+  arch=$(dpkg-deb -f "$deb" Architecture)
+  sysarch=$(dpkg --print-architecture)
+  msg_ok "Download abgeschlossen: ${pkg} ${version} (${arch})"
+
+  [[ "$arch" == "$sysarch" || "$arch" == "all" ]] \
+    || fail "Paket ist für ${arch}, dieses System ist ${sysarch}."
+  if [[ ! "${pkg,,}" =~ ninja ]]; then
+    msg_warn "Das Paket «${pkg}» sieht nicht nach dem NinjaOne-Agenten aus (Quelle: ${host})."
+    [[ $INTERACTIVE -eq 1 ]] && confirm "Trotzdem installieren?" || fail "Installation abgebrochen."
+  fi
 
   msg_info "Installiere NinjaOne-Agent"
-  if ! dpkg -i "$deb" >>"$LOG" 2>&1; then
-    msg_warn "dpkg meldet einen Fehler – versuche fehlende Abhängigkeiten zu installieren"
-    apt-get install -f -y >>"$LOG" 2>&1 || fail "Abhängigkeiten konnten nicht installiert werden."
-  fi
-  [[ -d "$AGENT_DIR" ]] || fail "Installation fehlgeschlagen: ${AGENT_DIR} fehlt."
+  # apt löst Abhängigkeiten gezielt für dieses Paket auf; --no-remove verhindert,
+  # dass auf dem PVE-Host dafür andere Pakete entfernt werden.
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-remove --reinstall "$deb" >>"$LOG" 2>&1 \
+    || fail "Installation fehlgeschlagen."
+  [[ "$(dpkg-query -W -f='${db:Status-Abbrev}' "$pkg" 2>/dev/null)" == "ii " ]] \
+    || fail "Installation fehlgeschlagen: Paket ${pkg} ist nicht vollständig installiert."
   msg_ok "Installation abgeschlossen"
 
   msg_info "Prüfe Dienst ${SERVICE}"
   local i
-  for i in {1..15}; do
+  for i in {1..30}; do
     systemctl is-active --quiet "$SERVICE" && break
     sleep 1
   done
-  if systemctl is-active --quiet "$SERVICE"; then
-    msg_ok "Dienst ${SERVICE} läuft"
-  else
-    msg_warn "Dienst ${SERVICE} läuft (noch) nicht – prüfen mit: systemctl status ${SERVICE}"
+  if ! systemctl is-active --quiet "$SERVICE"; then
+    {
+      systemctl status "$SERVICE" --no-pager
+      journalctl -u "$SERVICE" -n 20 --no-pager
+    } >>"$LOG" 2>&1 || true
+    fail "Paket installiert, aber der Dienst ${SERVICE} läuft nicht."
   fi
+  msg_ok "Dienst ${SERVICE} läuft"
 
   echo -e "\n${GN}Fertig.${CL} Das Gerät erscheint nach kurzer Zeit in NinjaOne (Organisation/Standort gemäss Installationslink)."
   rm -f "$LOG"

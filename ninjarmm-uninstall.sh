@@ -53,8 +53,20 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-# Paket über den Installationspfad ermitteln statt den Namen fest anzunehmen
-mapfile -t PACKAGES < <(dpkg -S "$AGENT_DIR" 2>/dev/null | cut -d: -f1 | tr ',' '\n' | sed 's/^ *//' | sort -u)
+# Paket über den Installationspfad ermitteln statt den Namen fest anzunehmen.
+# dpkg-query: Exit 1 = kein Paket besitzt den Pfad, Exit 2 = Datenbankfehler.
+rc=0
+OWNERS=$(LC_ALL=C dpkg-query -S "$AGENT_DIR" 2>/dev/null) || rc=$?
+if [[ $rc -gt 1 ]]; then
+  msg_error "Abfrage der Paketdatenbank fehlgeschlagen (dpkg-query -S, Exit ${rc}). Abbruch ohne Änderungen."
+  exit 1
+fi
+# Format «paket[:arch][, paket2]: pfad»; Diversion-Zeilen überspringen
+mapfile -t PACKAGES < <(printf '%s\n' "$OWNERS" | grep -v '^diversion ' | sed 's/: .*//' | tr ',' '\n' | sed 's/^ *//;/^$/d' | sort -u)
+if [[ ${#PACKAGES[@]} -gt 1 ]]; then
+  msg_error "Mehrere Pakete besitzen ${AGENT_DIR}: ${PACKAGES[*]} – bitte manuell prüfen (dpkg -l | grep -i ninja)."
+  exit 1
+fi
 
 if [[ ${#PACKAGES[@]} -eq 0 && ! -d "$AGENT_DIR" ]] && ! systemctl cat "$SERVICE" &>/dev/null; then
   msg_ok "Kein NinjaOne-Agent gefunden – nichts zu tun."
@@ -73,32 +85,36 @@ msg_info "Stoppe Dienst ${SERVICE}"
 systemctl disable --now "$SERVICE" &>/dev/null || true
 msg_ok "Dienst gestoppt"
 
-PURGED=0
-if [[ ${#PACKAGES[@]} -gt 0 ]]; then
-  msg_info "Entferne Paket ${PACKAGES[*]}"
-  if dpkg --purge "${PACKAGES[@]}" &>/dev/null; then
-    PURGED=1
-    msg_ok "Paket ${PACKAGES[*]} entfernt"
-  else
-    msg_warn "dpkg --purge fehlgeschlagen – räume Dateien manuell auf"
+if [[ ${#PACKAGES[@]} -eq 1 ]]; then
+  PKG="${PACKAGES[0]}"
+  msg_info "Entferne Paket ${PKG}"
+  LOG=$(mktemp /tmp/ninjarmm-uninstall.XXXXXX.log)
+  if ! dpkg --purge "$PKG" >"$LOG" 2>&1; then
+    # Keine Dateien von Hand löschen, solange dpkg das Paket noch führt
+    msg_error "dpkg --purge ${PKG} fehlgeschlagen. Ausgabe: ${LOG}"
+    tail -n 15 "$LOG"
+    exit 1
   fi
+  rm -f "$LOG"
+  msg_ok "Paket ${PKG} entfernt"
 fi
 
-# Reste entfernen (auch wenn der Agent ohne Paketverwaltung installiert wurde)
-rm -rf "$AGENT_DIR"
-rm -f "/etc/systemd/system/${SERVICE}" \
-      "/etc/systemd/system/multi-user.target.wants/${SERVICE}" \
-      "/lib/systemd/system/${SERVICE}"
-systemctl daemon-reload
-systemctl reset-failed &>/dev/null || true
+# Reste entfernen (von Maintainer-Skripten erzeugte Dateien oder Installation ohne Paket)
+msg_info "Räume Reste auf"
+rm -rf "$AGENT_DIR" \
+  && rm -f "/etc/systemd/system/${SERVICE}" \
+           "/etc/systemd/system/multi-user.target.wants/${SERVICE}" \
+           "/lib/systemd/system/${SERVICE}" \
+  || { msg_error "Reste konnten nicht entfernt werden."; exit 1; }
+systemctl daemon-reload || { msg_error "systemctl daemon-reload fehlgeschlagen."; exit 1; }
+systemctl reset-failed "$SERVICE" &>/dev/null || true
+msg_ok "Reste entfernt"
 
-if [[ -d "$AGENT_DIR" ]] || systemctl is-active --quiet "$SERVICE"; then
+if [[ -d "$AGENT_DIR" ]] || systemctl cat "$SERVICE" &>/dev/null \
+   || [[ -n "${PKG:-}" && "$(dpkg-query -W -f='${db:Status-Abbrev}' "$PKG" 2>/dev/null)" == i* ]]; then
   msg_error "Agent konnte nicht vollständig entfernt werden."
   exit 1
 fi
 
 msg_ok "NinjaOne-Agent wurde deinstalliert."
-if [[ ${#PACKAGES[@]} -gt 0 && $PURGED -eq 0 ]]; then
-  msg_warn "Paketeintrag ${PACKAGES[*]} steht noch in dpkg – prüfen mit: dpkg -l | grep -i ninja"
-fi
 echo -e "\n${YW}Hinweis:${CL} Das Gerät in NinjaOne zusätzlich löschen, sonst bleibt es als offline sichtbar."
