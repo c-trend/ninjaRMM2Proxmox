@@ -176,7 +176,7 @@ echo -e "\nDieses Skript installiert den NinjaOne-Agenten auf dem Proxmox-Server
 preflight
 
 if [[ $INTERACTIVE -eq 1 ]]; then
-  confirm "Fortfahren?" || { exit 0; }
+  confirm "Fortfahren?" || { echo "Abgebrochen."; exit 0; }
   ask_url
 fi
 
