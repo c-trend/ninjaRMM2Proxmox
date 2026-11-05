@@ -73,6 +73,11 @@ ls /opt/NinjaRMMAgent/programfiles
 dpkg -l | grep -i ninja
 ```
 
+Der Paketname ist nicht fest, sondern enthält Organisation und Standort aus
+dem Installationslink (inkl. `.deb` im Namen), z. B.
+`ninjaone-agent-<organisation>-<standort>-auto-x86-64.deb`. Die
+Deinstallation ermittelt ihn deshalb über `dpkg -S /opt/NinjaRMMAgent`.
+
 ## Sicherheit
 
 Die Einzeiler führen ein Skript direkt aus dem Internet aus. Wer das nicht
